@@ -1,7 +1,14 @@
-# Skill: wp-optimize
-
-## Trigger
-Invoke when the user says: "wp-optimize", "optimizar wordpress", "diagnosticar servidor wordpress", "wordpress lento", "wordpress performance", "optimize wordpress server", or similar.
+---
+name: wp-optimize
+description: "Full WordPress server optimization via SSH. Connects to any WordPress server, runs a 12-metric diagnostic, presents a prioritized issue report, applies fixes adapted to the detected stack (nginx/Apache/LiteSpeed, cPanel/Plesk/VestaCP/HestiaCP/DirectAdmin/none), and verifies the improvement. Use when user says /wp-optimize, wordpress lento, optimizar wordpress, wordpress performance, or similar."
+user-invokable: true
+argument-hint: "[ssh-host]"
+license: MIT
+metadata:
+  author: buenroger
+  version: "1.0.0"
+  category: wordpress
+---
 
 ## Goal
 Connect to any WordPress server via SSH, run a full diagnostic, present a prioritized issue report, apply approved fixes adapted to the detected stack, and verify the improvement. Works on any hosting: Raiola, Hostinger, SiteGround, Kinsta, DigitalOcean, any VPS or shared host with SSH.
