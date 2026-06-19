@@ -6,7 +6,7 @@ argument-hint: "[ssh-host]"
 license: MIT
 metadata:
   author: buenroger
-  version: "1.1.0"
+  version: "1.2.0"
   category: wordpress
 ---
 
@@ -119,6 +119,22 @@ head -5 WP_ROOT/wp-content/object-cache.php | grep -i "Plugin Name"
 $WPCLI eval 'echo wp_using_ext_object_cache() ? "TRUE" : "FALSE";' --allow-root
 ```
 If the drop-in's header names a caching plugin (LiteSpeed Cache, Redis Object Cache, W3TC, etc.) that is **not** in the active/installed plugin list, the drop-in is orphaned — almost always a leftover from a previous caching stack (e.g. site migrated from LiteSpeed Cache to WP Rocket and nobody removed the old drop-in). This is a CRITICAL finding: it cascades into making every other plugin's transient-based caching silently fail. See **FIX I**.
+
+### 2.9 Check whether Redis/Memcached actually has a running service, not just a PHP module
+`php -m | grep -iE 'redis|memcache'` only proves the *client library* is compiled in — it says nothing about whether a server is reachable. On budget shared hosting it's common to have the module but no service (Redis/Memcached are usually gated to higher hosting tiers). Always verify with an actual connection attempt before recommending or assuming object-cache-backed gains are available:
+```bash
+cat > /tmp/test_redis.php << 'EOF'
+<?php
+$r = new Redis();
+try {
+    echo $r->connect('127.0.0.1', 6379, 1) ? "CONNECTED\n" : "FAILED\n";
+} catch (Exception $e) {
+    echo "EXCEPTION: " . $e->getMessage() . "\n";
+}
+EOF
+timeout 10 php /tmp/test_redis.php; rm -f /tmp/test_redis.php
+```
+If this times out / fails, say so plainly: persistent object caching is not available without a hosting plan change, and set expectations accordingly before investing time chasing per-request DB query counts further (see FIX M's ceiling note).
 
 ### 2.6 Detect PHP-FPM pool config path
 ```bash
@@ -477,6 +493,56 @@ Never leave a profiling mu-plugin installed — it's a query-string-gated backdo
 
 A broader variant hooks the `all` action instead of `http_api_debug` to catch slow non-HTTP hooks (e.g. a slow DB query inside a hook with no outbound request), logging any gap between consecutive hook firings above a threshold (e.g. 50ms) — useful when FIX K's HTTP-only trace comes up clean but the page is still slow.
 
+### FIX L: Attribute DB query count to the responsible plugin (no guessing, no bisection)
+
+When `get_num_queries()` shows a high count on a slow page (e.g. 300-400+ on a single WooCommerce cart/checkout load) and 50+ plugins are active, don't audit plugin source code one by one and don't deactivate-and-remeasure 50 times — hook the `query` filter once and attribute every query to its caller via `debug_backtrace()`. One page load gives a precise ranking:
+
+```php
+<?php
+// wp-content/mu-plugins/zzz-profile-bysource.php — only activates with ?profile_run=1
+if (!isset($_GET['profile_run'])) return;
+$GLOBALS['__q_by_source'] = [];
+add_filter('query', function($sql) {
+    $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+    $source = 'core/unknown';
+    foreach ($trace as $frame) {
+        if (!isset($frame['file'])) continue;
+        if (preg_match('#/wp-content/plugins/([^/]+)/#', $frame['file'], $m)) { $source = 'plugin: ' . $m[1]; break; }
+        if (preg_match('#/wp-content/themes/([^/]+)/#', $frame['file'], $m)) { $source = 'theme: ' . $m[1]; break; }
+    }
+    $GLOBALS['__q_by_source'][$source] = ($GLOBALS['__q_by_source'][$source] ?? 0) + 1;
+    return $sql;
+});
+add_action('shutdown', function() {
+    arsort($GLOBALS['__q_by_source']);
+    $out = "TOTAL: " . array_sum($GLOBALS['__q_by_source']) . "\n\n";
+    foreach ($GLOBALS['__q_by_source'] as $source => $count) $out .= sprintf("%4d  %s\n", $count, $source);
+    file_put_contents('/tmp/profile_bysource.txt', $out);
+}, 9999);
+```
+This doesn't need `SAVEQUERIES` defined — `get_num_queries()` and counting via the `query` filter work regardless. Run it, read `/tmp/profile_bysource.txt`, remove the mu-plugin and the temp file immediately (same discipline as FIX K).
+
+Once a plugin is identified as a top contributor, get the exact call site (not just the plugin name) by filtering the backtrace for that specific plugin's path and recording `file:line` instead of just the plugin slug — this finds the actual function (and from there, the actual hook it's attached to) instead of leaving it as a guess. Then judge case by case:
+- **Necessary work** (active firewall/audit logging, a payment gateway's real cache-miss API call, WooCommerce's own cart/tax/shipping calculation) — leave alone, don't sacrifice security or correctness for query count.
+- **Genuinely unconditional overhead** (a feature plugin checking its own settings on every single page load regardless of whether that page uses any of its features) — first look for an official setting/filter to scope or disable that code path; only consider FIX M if it's an autoload problem.
+
+### FIX M: Fix "reverse autoload bloat" — small options forced into individual queries
+
+The usual WordPress advice is "reduce autoloaded options, they bloat the bootstrap query." The opposite problem also exists and is just as costly: a plugin checking many small feature-toggle/telemetry options via `get_option()` with `autoload` explicitly `off` (or via options that don't exist as rows at all) forces one individual `SELECT ... WHERE option_name = 'X'` query per option, on every page load, instead of riding along in WordPress's single bulk autoload query that already runs regardless.
+
+1. Get the exact option names FIX L's backtrace technique surfaced (or capture them directly — see the `query` filter regex variant: match `SELECT option_value FROM .* option_name = '([^']+)'` and log the captured key whenever the call stack passes through the suspect plugin).
+2. Check what's actually in the DB for them:
+   ```bash
+   $WPCLI db query "SELECT option_name, autoload, LENGTH(option_value) FROM wp_options WHERE option_name IN ('key1','key2',...);" --allow-root
+   ```
+3. **Only options that actually exist with `autoload = off`** can be safely fixed — flip them:
+   ```bash
+   $WPCLI db query "UPDATE wp_options SET autoload='on' WHERE option_name IN ('key1','key2',...);" --allow-root
+   ```
+   This is safe and low-risk: it changes nothing about the option's value or behavior, only how WordPress fetches it.
+4. **Options that don't exist as rows at all** (very common — a plugin calls `get_option('foo', $default)` for a setting the user never touched, so there's nothing to flip) **cannot be fixed this way.** Don't manually `INSERT` fake rows to fake an autoload entry — it's fragile (gets overwritten or duplicated the moment the plugin's own settings-save logic runs) and not a real fix. Say so plainly to the user: this specific cost is structural and only goes away with a real persistent object cache (Redis/Memcached — see 2.9), which doesn't change DB rows, it adds a request-spanning cache so the "does this exist" check itself stops hitting MySQL.
+5. **Set expectations honestly.** On a page with 50+ active plugins each checking a handful of their own options, fixing 2-3 autoload flags will show up in a precise query-count diff but is unlikely to be measurable in wall-clock time (each such query costs low single-digit milliseconds; curl timing noise from network/TLS easily exceeds the gain). Report the query-count win as real and worth doing, without overstating the user-facing speed impact.
+
 ---
 
 ## PHASE 6 — Verification
@@ -522,6 +588,11 @@ List any **remaining issues** not yet fixed (pending actions for the user, e.g.,
 - Use `$WPCLI litespeed-purge all` after config changes
 - PHP-FPM pool may be managed by lsphp process, not standard php-fpm
 - Check: `ps aux | grep lsphp`
+
+### Shared hosting without Redis/Memcached (verified via 2.9)
+- There is a real, honest performance floor here: every `get_option()` call for a non-autoloaded or non-existent option costs a fresh MySQL round-trip on every single page load, with no way to cache it across requests.
+- After fixing object-cache integrity (FIX I), cron (FIX H), and third-party API caching (FIX J), further gains from auditing individual plugins' query counts (FIX L/M) have steeply diminishing returns — each additional fix is typically 1-5 queries / a few ms, not seconds.
+- Say this directly to the user once reached, rather than continuing to chase incremental plugin-by-plugin wins indefinitely: the two paths forward are (a) reduce the number of active plugins (a product decision, not a technical one) or (b) upgrade the hosting plan for a real persistent object cache. Don't let the user believe more SSH-side tuning will close that gap.
 
 ### Managed hosting (Kinsta, WP Engine, Flywheel)
 - SSH access is usually non-root, restricted to the site user
