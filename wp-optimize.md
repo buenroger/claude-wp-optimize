@@ -6,7 +6,7 @@ argument-hint: "[ssh-host]"
 license: MIT
 metadata:
   author: buenroger
-  version: "1.0.0"
+  version: "1.1.0"
   category: wordpress
 ---
 
@@ -103,6 +103,23 @@ which wp 2>/dev/null || which /usr/local/bin/wp 2>/dev/null
 ```
 Set `$WPCLI="wp --path=WP_ROOT --allow-root"` for all subsequent WP-CLI calls.
 
+### 2.8 Verify object cache integrity (not just presence)
+A site can have `wp_using_ext_object_cache() === true` while the actual caching backend is dead — this silently breaks every plugin that relies on transients (payment gateways, shipping APIs, tracking pixels), because each one *thinks* it's caching but nothing survives between requests. Always verify the drop-in actually works, don't just check it exists:
+
+```bash
+# Does a drop-in exist?
+ls -la WP_ROOT/wp-content/object-cache.php 2>/dev/null
+
+# If it's a LiteSpeed Cache drop-in, the litespeed-cache PLUGIN must also be present —
+# the drop-in self-disables on the frontend if the plugin folder is missing
+$WPCLI plugin list --allow-root --fields=name | grep -i litespeed
+head -5 WP_ROOT/wp-content/object-cache.php | grep -i "Plugin Name"
+
+# Sanity check: does wp_using_ext_object_cache() agree with reality?
+$WPCLI eval 'echo wp_using_ext_object_cache() ? "TRUE" : "FALSE";' --allow-root
+```
+If the drop-in's header names a caching plugin (LiteSpeed Cache, Redis Object Cache, W3TC, etc.) that is **not** in the active/installed plugin list, the drop-in is orphaned — almost always a leftover from a previous caching stack (e.g. site migrated from LiteSpeed Cache to WP Rocket and nobody removed the old drop-in). This is a CRITICAL finding: it cascades into making every other plugin's transient-based caching silently fail. See **FIX I**.
+
 ### 2.6 Detect PHP-FPM pool config path
 ```bash
 # Varies by panel and distro:
@@ -144,6 +161,9 @@ echo "=== BOT ADD-TO-CART ===" && tail -5000 ACCESS_LOG 2>/dev/null | grep 'add-
 echo "=== LOAD STYLES TEST ===" && curl -sk -o /dev/null -w '%{http_code} %{time_total}' "https://DOMAIN/wp-admin/load-styles.php?c=1&dir=ltr&load%5Bchunk_0%5D=dashicons,common" 2>/dev/null
 echo "=== CONCATENATE_SCRIPTS ===" && grep 'CONCATENATE_SCRIPTS' WP_CONFIG 2>/dev/null || echo "not set (default: true)"
 echo "=== MEMORY LIMIT ===" && $WPCLI eval 'echo WP_MEMORY_LIMIT;' 2>/dev/null
+echo "=== WP-CRON BACKLOG (overdue events) ===" && $WPCLI cron event list --allow-root --format=csv 2>/dev/null | grep -c ',now,'
+echo "=== WP-CRON TOTAL EVENTS ===" && $WPCLI cron event list --allow-root --format=count 2>/dev/null
+echo "=== CART/CHECKOUT TIMING (WooCommerce only) ===" && curl -sk --max-time 20 -o /dev/null -w 'cart: %{http_code} %{time_total}s\n' "https://DOMAIN/cart/" 2>/dev/null
 ```
 
 ### Key metrics to compute
@@ -153,6 +173,9 @@ echo "=== MEMORY LIMIT ===" && $WPCLI eval 'echo WP_MEMORY_LIMIT;' 2>/dev/null
 - **Bot ratio**: `add_to_cart_requests / total_last_5000 > 20%` = suspicious
 - **load-styles latency**: `> 3s` = problem, `504/timeout` = critical
 - **Load average vs CPUs**: `load_1min / nproc > 2` = critical
+- **WP-Cron backlog**: more than ~15-20 overdue (`,now,`) events = warning; this number must be near-zero before attempting FIX H (moving cron off page-load), or the first real-cron run can time out / 503 trying to process the backlog synchronously
+- **Cart/checkout vs home delta**: if cart/checkout is 3x+ slower than the home page on a WooCommerce site, suspect synchronous third-party API calls (payment gateways, shipping rate plugins, tracking pixels) rather than server resources — profile with the technique in **FIX K** before touching PHP-FPM or server config
+- **Cart/checkout test methodology**: always test with a persistent cookie jar (`curl -c jar.txt -b jar.txt`), not a bare curl — each cookie-less request creates a brand-new anonymous WooCommerce session, which can mask or distort real timing. Run at least 2-3 requests with the same jar; the first may be a genuine cache miss.
 
 ---
 
@@ -343,6 +366,117 @@ If PHP fatal errors found in error log pointing to a specific plugin:
 $WPCLI plugin deactivate PLUGIN_NAME --skip-plugins
 ```
 
+### FIX H: Move WP-Cron off page-load to a real server cron job
+
+**Never do this in one step.** Disabling `DISABLE_WP_CRON` while there's a backlog of overdue events causes WordPress to try to process the entire backlog synchronously on the very first real cron hit — this can 503/timeout the site for 30-60+ seconds. Sequence matters:
+
+1. **Check the backlog first**: `$WPCLI cron event list --allow-root --format=csv | grep -c ',now,'`. If more than ~15-20, clean it up before proceeding (see the orphaned-hook cleanup below).
+2. **Clean genuinely orphaned cron hooks** — events whose callback no longer exists because the plugin was uninstalled (common after migrating away from Jetpack, Elementor, Divi, UpdraftPlus, WPCode, MonsterInsights, Siteground Optimizer, etc.). Cross-reference, don't guess:
+   ```bash
+   # List unique hooks currently scheduled
+   $WPCLI cron event list --allow-root --fields=hook --format=csv | sort -u
+
+   # For each suspicious hook, confirm no plugin/theme file references it anywhere on disk
+   grep -rl "HOOK_NAME" WP_ROOT/wp-content/plugins WP_ROOT/wp-content/themes WP_ROOT/wp-content/mu-plugins 2>/dev/null
+
+   # If truly no match anywhere, delete it — it will never run anyway
+   $WPCLI cron event delete 'HOOK_NAME' --allow-root
+   ```
+   Don't delete an event just because it's a duplicate or one-off "Non-repeating" entry without checking — some are legitimate one-shot tasks that simply haven't fired yet (real traffic clears those naturally). Only delete what's confirmed orphaned (no code on disk) or confirmed stale duplicates of the same one-shot hook.
+3. **Create the real cron job** — via the host's panel (hPanel, cPanel "Cron Jobs", Plesk "Scheduled Tasks") if no root crontab access, or `crontab -e` if root:
+   ```bash
+   */5 * * * * wget -q -O /dev/null "https://DOMAIN/wp-cron.php?doing_wp_cron" >/dev/null 2>&1
+   ```
+4. **Verify the real cron endpoint responds before disabling the page-load trigger**:
+   ```bash
+   curl -sk -o /dev/null -w 'code=%{http_code} time=%{time_total}s\n' --max-time 30 "https://DOMAIN/wp-cron.php?doing_wp_cron"
+   ```
+5. **Only then** add to wp-config.php (back up first):
+   ```bash
+   cp WP_ROOT/wp-config.php WP_ROOT/wp-config.php.bak-precron
+   ```
+   ```php
+   define( 'DISABLE_WP_CRON', true );
+   ```
+6. **Verify with a timeout safety net**, never a bare curl that could hang:
+   ```bash
+   curl -sk -o /dev/null -w 'code=%{http_code} time=%{time_total}s\n' --max-time 20 "https://DOMAIN/"
+   ```
+   If this is slow/errors (503, 30s+), **immediately restore** `cp WP_ROOT/wp-config.php.bak-precron WP_ROOT/wp-config.php` — the backlog wasn't actually cleared, go back to step 1.
+
+### FIX I: Remove an orphaned object-cache.php drop-in
+
+If 2.8 found a drop-in whose backing plugin isn't installed, it's dead weight that's actively breaking every transient-dependent plugin on the site (payment gateways, shipping rate caches, tracking pixel config — see FIX J). Safe to remove:
+
+```bash
+cp WP_ROOT/wp-content/object-cache.php WP_ROOT/wp-content/object-cache.php.bak-orphan
+rm WP_ROOT/wp-content/object-cache.php
+$WPCLI eval 'echo wp_using_ext_object_cache() ? "TRUE" : "FALSE";' --allow-root   # should now print FALSE
+```
+After removal, WordPress falls back to options-table-backed transients, which actually persist. Re-test any cart/checkout slowness *after* this fix, before chasing individual plugins — it's often the real root cause behind seemingly unrelated "plugin X calls its API on every page load" symptoms. Note that some hosts (e.g. Hostinger's server-level LiteSpeed integration) can silently recreate this drop-in later; if performance regresses again, re-check 2.8.
+
+### FIX J: Extend a too-short transient cache on a third-party API plugin
+
+Real-time shipping rate plugins (Envia, Packlink), payment gateways (PayPal Payments, Stripe), and tracking pixels (Meta/Facebook Conversions API) often cache their external API responses in a transient with a short TTL (commonly 10 minutes) baked into the plugin's own code. On a site with sparse cart/checkout traffic, every visit can be a cache miss, adding 1-3+ seconds per call. Don't patch the plugin's files (lost on update). Instead:
+
+1. **Confirm caching is actually broken first** (run FIX I's check — a dead object-cache.php drop-in causes exactly this symptom across multiple plugins simultaneously; fix that before touching individual plugins).
+2. **Look for an official non-blocking/async filter** before writing a workaround — well-maintained plugins often ship one specifically for this. Example, Meta/Facebook for WooCommerce:
+   ```bash
+   grep -rn "non_blocking\|blocking.*false" WP_ROOT/wp-content/plugins/facebook-for-woocommerce/includes/API.php
+   ```
+   ```php
+   // mu-plugin or Code Snippets — official filter, documented by the plugin itself
+   add_filter('wc_facebook_pixel_events_non_blocking', '__return_true');
+   ```
+3. **If no official filter exists**, find the transient key and prefix in the plugin's code (`grep -rn "set_transient\|new Cache(" PLUGIN_DIR`), then re-extend it via whatever value-filter the plugin exposes (many call `apply_filters` right after caching the value — hook that filter and call `set_transient()` again with a longer TTL under the same key). Example, PayPal Payments:
+   ```php
+   add_filter('woocommerce_paypal_payments_seller_status', function ($status) {
+       if ($status instanceof \WooCommerce\PayPalCommerce\ApiClient\Entity\SellerStatus) {
+           set_transient('ppcp-seller-status-seller_status', $status, HOUR_IN_SECONDS);
+       }
+       return $status;
+   });
+   ```
+4. Always disclose the trade-off to the user (slower to reflect upstream changes, e.g. PayPal capability changes take up to the new TTL to show) and confirm before installing.
+5. Save the snippet to a file for the user to install via a snippets plugin (Code Snippets, WPCode) rather than editing core plugin files or wp-config.php directly — survives plugin updates, easy to disable/audit.
+
+### FIX K: Diagnostic technique — profile slow page loads with a temporary mu-plugin
+
+When a specific page (cart, checkout) is slow but server resources (RAM, CPU, load average) look healthy, the cause is usually synchronous work inside the page's own hooks — most often outbound HTTP calls to third-party APIs. Standard tools (curl timing, error log) won't show *which* plugin or hook is responsible. A temporary mu-plugin will, without needing Xdebug or paid APM:
+
+**Always explain this technique to the user and get explicit confirmation before installing it** — it is live code running on the production site, even though scoped and temporary.
+
+```php
+<?php
+// wp-content/mu-plugins/zzz-profile-temp.php — only activates with ?profile_run=1
+if (!isset($_GET['profile_run'])) return;
+$GLOBALS['__prof_start'] = microtime(true);
+add_action('http_api_debug', function($response, $context, $class, $args, $url) {
+    $t = microtime(true) - $GLOBALS['__prof_start'];
+    $blocking = isset($args['blocking']) ? ($args['blocking'] ? 'blocking' : 'NON-BLOCKING') : 'blocking(default)';
+    file_put_contents('/tmp/profile_urls.txt', sprintf("[t=%.3fs] [%s] %s\n", $t, $blocking, $url), FILE_APPEND);
+}, 10, 5);
+add_action('shutdown', function() {
+    file_put_contents('/tmp/profile_urls.txt', sprintf("TOTAL: %.3fs\n", microtime(true) - $GLOBALS['__prof_start']), FILE_APPEND);
+}, 9999);
+```
+
+Usage:
+```bash
+rm -f /tmp/profile_urls.txt
+curl -sk --max-time 30 -o /dev/null -w 'total=%{time_total}s\n' "https://DOMAIN/cart/?profile_run=1"
+cat /tmp/profile_urls.txt
+```
+This hooks `http_api_debug` (fires on every `wp_remote_*` call) and logs the elapsed time and URL of each one, plus whether it was blocking. Read top-to-bottom: large gaps between timestamps point to the slow call. Run it twice in a row — if the same external calls reappear on the second run with similar timing, caching isn't holding (see FIX I/J); if they disappear, caching is working and the remaining time is genuine PHP/DB processing.
+
+**Always remove the file immediately after reading the result**, even between iterations:
+```bash
+rm -f WP_ROOT/wp-content/mu-plugins/zzz-profile-temp.php /tmp/profile_urls.txt
+```
+Never leave a profiling mu-plugin installed — it's a query-string-gated backdoor by design and shouldn't persist past the diagnostic session.
+
+A broader variant hooks the `all` action instead of `http_api_debug` to catch slow non-HTTP hooks (e.g. a slow DB query inside a hook with no outbound request), logging any gap between consecutive hook firings above a threshold (e.g. 50ms) — useful when FIX K's HTTP-only trace comes up clean but the page is still slow.
+
 ---
 
 ## PHASE 6 — Verification
@@ -411,6 +545,13 @@ List any **remaining issues** not yet fixed (pending actions for the user, e.g.,
 - Before modifying wp-config.php, verify the change doesn't already exist: `grep 'CONSTANT_NAME' wp-config.php`
 - For any destructive change (plugin deactivation, file modification), confirm with user first
 - Keep a one-liner rollback ready before applying each fix
+- **Always `cp file file.bak-DESCRIPTIVE-SUFFIX` before editing wp-config.php** (not git — most of these sites have no VCS). Restore immediately if verification fails after a change.
+- **Never disable WP-Cron's page-load trigger before checking/clearing the overdue-event backlog** (see FIX H) — this caused a real 503 outage during testing when skipped.
+- **Truncate, don't delete, large log files**: use `: > /path/error_log`, never `rm`. PHP may hold the file open; `rm` detaches the inode while PHP keeps writing into the now-unlinked file, so nothing is recoverable and disk space isn't even freed until the process cycles.
+- **Always add `--max-time N` to verification curls** after a risky change (cron, FPM, wp-config edits). A hung request with no timeout can block the session for a minute or more if something went wrong — and a 503/30s+ response after a config change is itself the signal to roll back immediately, not retry.
+- **`wp_using_ext_object_cache() === true` is not proof caching works** — verify the drop-in's backing plugin is actually installed (see 2.8 / FIX I) before trusting any transient-based diagnosis or fix.
+- **When testing "does deactivating plugin X fix the slowness", reactivate immediately if it didn't help** — don't leave a production plugin deactivated while you keep investigating.
+- A profiling mu-plugin (FIX K) is live code on a production site — always explain what it does and get explicit confirmation before installing it, even though it's temporary and query-string-gated.
 
 ---
 
