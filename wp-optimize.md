@@ -6,7 +6,7 @@ argument-hint: "[ssh-host]"
 license: MIT
 metadata:
   author: buenroger
-  version: "1.2.0"
+  version: "1.3.0"
   category: wordpress
 ---
 
@@ -604,6 +604,29 @@ List any **remaining issues** not yet fixed (pending actions for the user, e.g.,
 - `load-styles.php` goes through PHP-FPM via nginx fastcgi_pass, not proxy_pass
 - PHP-FPM pool config is at `/etc/php/X.X/fpm/pool.d/`
 - Reload: `systemctl reload phpX.X-fpm`
+
+---
+
+## PHASE 7 — PageSpeed Insights integration (frontend/field data) — ⚠️ PENDING, not yet implemented
+
+**Status: planned, not built.** Flagged 2026-06-19 during an infortop.es session. Next session that touches this skill should implement this phase before considering the skill "done" for that round. Until implemented, the skill is purely server-side (SSH/PHP/DB) — it has no visibility into browser-rendering performance or real-user field data.
+
+**Why this is a separate phase, not a replacement for anything above:** everything in Phases 1-6 diagnoses and fixes server response time (TTFB) — PHP-FPM, DB queries, cron, cache integrity, third-party API latency. PageSpeed Insights (PSI) measures a different layer entirely: what happens in the browser after the HTML arrives (render-blocking CSS/JS, unoptimized images, layout shift, JS execution time), plus real Chrome User Experience Report (CrUX) field data — actual Core Web Vitals from real visitors over the last 28 days, not a synthetic curl. Both layers matter; neither substitutes for the other.
+
+**Critical scope limit to respect when implementing this:** PSI/CrUX only works on public, indexable, sufficiently-trafficked URLs. It does **not** meaningfully cover cart, checkout, my-account, or other dynamic/session-based WooCommerce pages — those either have no CrUX field data (too unique per session) or return misleading Lighthouse lab results (an anonymous crawl sees an empty cart, the same blind spot this skill hit repeatedly with bare curl before switching to cookie-jar testing). Scope this phase to home, category/shop, and product pages — the actual SEO/UX-facing surface — and say so explicitly in the report so the user doesn't expect it to explain cart/checkout slowness.
+
+**Planned implementation, when picked up:**
+1. **Setup**: requires a (free) Google Cloud API key for the PageSpeed Insights API. Ask the user for it at the start of this phase if not already stored; check for it the same way as SSH creds (look for a config file in the project directory first).
+2. **Fetch both lab and field data** for each candidate URL:
+   ```bash
+   curl -s "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=https://DOMAIN/&key=API_KEY&strategy=mobile&category=performance" \
+     | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['lighthouseResult']['categories']['performance']['score']); print(d.get('loadingExperience',{}).get('metrics',{}))"
+   ```
+   Run for `strategy=mobile` and `strategy=desktop` separately — they often diverge significantly and both matter.
+3. **Extract actionable opportunities** from `lighthouseResult.audits`, in particular: `render-blocking-resources`, `unused-css-rules`, `unused-javascript`, `largest-contentful-paint-element`, `modern-image-formats`, `uses-responsive-images`, `total-byte-weight`, `main-thread-tasks`.
+4. **Cross-reference field data (CrUX)** from `loadingExperience.metrics` (LCP, CLS, INP) against the lab score — if field data is much worse than lab, suspect real-world conditions (slow mobile networks, third-party scripts only loaded for real users e.g. ads/consent banners) that a clean lab run won't show.
+5. **Fold into the existing Phase 4 issue report** as a new category (e.g. "FRONTEND") alongside the existing CRITICAL/WARNING/INFO findings, clearly labeled as browser-side rather than server-side, so the prioritized fix list stays unified instead of fragmenting into two separate reports.
+6. **Likely fixes this surfaces** that Phases 1-6 don't cover: image format/compression (WebP/AVIF, e.g. via Imagify/ShortPixel if already installed — check before recommending installing a new plugin), critical CSS / render-blocking resource fixes (often a setting in the existing cache plugin, e.g. WP Rocket's "Optimize CSS Delivery" — check if already enabled before assuming it needs configuring), and font loading strategy (`font-display`, preloading).
 
 ---
 
