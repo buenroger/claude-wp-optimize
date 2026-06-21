@@ -6,6 +6,8 @@ Works on any hosting provider: Raiola, Hostinger, SiteGround, Kinsta, DigitalOce
 
 ## What it does
 
+**Phase 0 — Resume:** Checks for `ISSUES.md`/`ACTION-PLAN.md`/`PROGRESS.md` from a previous session on this same site. If found, picks up exactly where it left off instead of re-running detection — saves tokens on every repeat visit to a site you've already optimized.
+
 **Phase 1 — Connection:** Detects Windows/Linux/Mac and picks the right SSH method (plink, sshpass, or ssh key). Handles base64 encoding for complex remote commands.
 
 **Phase 2 — Detection:** Identifies control panel (cPanel, Plesk, HestiaCP, VestaCP, DirectAdmin, none), web server (Apache / nginx / LiteSpeed), PHP handler (FPM / mod_php / CGI), and locates all WordPress installations.
@@ -24,6 +26,8 @@ Works on any hosting provider: Raiola, Hostinger, SiteGround, Kinsta, DigitalOce
 - Safe plugin deactivation for PHP fatal errors
 
 **Phase 6 — Verification:** Re-runs key metrics and shows a before/after comparison table.
+
+**Phase 7 — Handoff documents:** Writes/updates `ISSUES.md`, `ACTION-PLAN.md`, and `PROGRESS.md` under `./wp-optimize/<domain>/` in your project directory — a dated issue log, a priority checklist, and a factual stack/fix snapshot for Phase 0 to pick up next time. Runs at the end of every session, clean finish or interrupted.
 
 ## Supported stacks
 

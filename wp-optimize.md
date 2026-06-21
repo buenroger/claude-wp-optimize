@@ -1,17 +1,39 @@
 ---
 name: wp-optimize
-description: "Full WordPress server optimization via SSH. Connects to any WordPress server, runs a 12-metric diagnostic, presents a prioritized issue report, applies fixes adapted to the detected stack (nginx/Apache/LiteSpeed, cPanel/Plesk/VestaCP/HestiaCP/DirectAdmin/none), and verifies the improvement. Use when user says /wp-optimize, wordpress lento, optimizar wordpress, wordpress performance, or similar."
+description: "Full WordPress server optimization via SSH. Connects to any WordPress server, runs a 12-metric diagnostic, presents a prioritized issue report, applies fixes adapted to the detected stack (nginx/Apache/LiteSpeed, cPanel/Plesk/VestaCP/HestiaCP/DirectAdmin/none), and verifies the improvement. Leaves behind ISSUES.md/ACTION-PLAN.md/PROGRESS.md per site so future sessions resume exactly where the last one stopped, without re-running detection. Use when user says /wp-optimize, wordpress lento, optimizar wordpress, wordpress performance, or similar."
 user-invokable: true
 argument-hint: "[ssh-host]"
 license: MIT
 metadata:
   author: buenroger
-  version: "1.3.0"
+  version: "1.4.0"
   category: wordpress
 ---
 
 ## Goal
 Connect to any WordPress server via SSH, run a full diagnostic, present a prioritized issue report, apply approved fixes adapted to the detected stack, and verify the improvement. Works on any hosting: Raiola, Hostinger, SiteGround, Kinsta, DigitalOcean, any VPS or shared host with SSH.
+
+Every session — finished or interrupted — leaves behind three handoff documents (see **PHASE 7**) so the next session can resume at the exact point it left off without re-running detection from scratch.
+
+---
+
+## PHASE 0 — Resume from a previous session (check before doing anything else)
+
+Before asking for SSH credentials or running any detection, check whether this site already has session documents from a prior run:
+
+```bash
+find . -maxdepth 3 -ipath "*wp-optimize*PROGRESS.md" 2>/dev/null
+```
+
+Session documents live at `./wp-optimize/<domain>/{ISSUES.md,ACTION-PLAN.md,PROGRESS.md}` relative to the current working directory (see PHASE 7 for the exact format). If found for the domain in question:
+
+1. **Read `PROGRESS.md` first.** It contains the SSH connection pattern, full detected stack (panel, webserver, PHP handler/version, WP_ROOT, WP-CLI path, pool config path, nginx config path), the timestamped list of fixes already applied and verified, and the list of fixes still pending with ready-to-run commands. This replaces re-running PHASE 1-2 detection — don't re-detect what's already recorded, just re-verify connectivity (a single lightweight `echo CONNECTED` SSH call) and trust the rest unless something looks stale (see freshness rule below).
+2. **Read `ACTION-PLAN.md`** to see exactly which checklist items are still open and pick up from there — skip straight to the next unchecked item instead of re-presenting the full PHASE 4 report.
+3. **Read `ISSUES.md`** only if you need the original full diagnostic context (e.g. the user asks "why did we flag X").
+4. **Freshness rule:** if `PROGRESS.md`'s timestamp is more than ~7 days old, or the site stack might have changed (manual hosting migration, plugin changes outside this skill), do a quick spot-check (PHASE 2's panel/webserver/PHP detection, ~3 commands) before trusting the rest blindly. If it checks out, proceed without re-running the full PHASE 2-3 detection suite.
+5. Tell the user plainly what you're resuming and from where, e.g.: *"Encontré una sesión previa de wp-optimize para DOMAIN del DATE. Ya se aplicaron los fixes A y B; quedan pendientes C y D. Retomando desde ahí."*
+
+If no session documents exist for this domain, proceed normally from PHASE 1.
 
 ---
 
@@ -575,6 +597,85 @@ List any **remaining issues** not yet fixed (pending actions for the user, e.g.,
 
 ---
 
+## PHASE 7 — Session Handoff Documents
+
+**Run this phase at the end of every session — and also immediately if the session gets interrupted mid-fix, not just on a clean finish.** The goal: the next session (possibly weeks later, possibly a different context with zero memory of this one) can resume at the exact point this one stopped, spending tokens on new work instead of re-discovering the stack and re-diagnosing issues already known.
+
+Create/update three files at `./wp-optimize/<domain>/` (relative to the current working directory — create the directory if it doesn't exist):
+
+### 1. `ISSUES.md` — what was found
+A dated log of every issue surfaced by PHASE 4, in the same CRITICAL/WARNING/INFO structure, **append-only across sessions** (don't delete old entries — mark them resolved instead). Each entry needs a stable short ID (e.g. `#A1`, `#A2`...) so ACTION-PLAN.md and PROGRESS.md can reference them without repeating the full description.
+
+```markdown
+# Issues — DOMAIN
+
+## Session 2026-06-21
+### CRITICAL
+- **#A1** PHP-FPM max_children=32 but only 6 safe workers (RAM) — OOM/swap crash risk
+
+### WARNING
+- **#A2** Object-cache.php drop-in orphaned (LiteSpeed Cache plugin not installed) — breaks transient caching sitewide
+- **#A3** 56 active plugins, ~190 individual non-batched option queries per uncached page load
+
+### INFO
+- **#A4** WP_DEBUG not set (expected for production, no action needed)
+
+## Session 2026-07-03
+- **#A2** RESOLVED 2026-07-03 — removed orphaned drop-in, wp_using_ext_object_cache() now correctly returns FALSE
+```
+
+### 2. `ACTION-PLAN.md` — the checklist
+A flat, priority-ordered checklist referencing the issue IDs above. This is the file to scan first when resuming: scroll to the first unchecked box.
+
+```markdown
+# Action Plan — DOMAIN
+
+- [x] **#A2** Remove orphaned object-cache.php drop-in — done 2026-07-03, verified
+- [ ] **#A1** Reduce PHP-FPM max_children to 6 — pending, needs root/panel access not yet confirmed
+- [ ] **#A3** Audit 56 active plugins for redundancy — pending, needs user input on which plugins are actively used (asked, awaiting answer)
+```
+
+For every unchecked item, include enough detail to act without re-deriving it: the exact command (or "needs user decision: X vs Y"), and why it's blocked if it's blocked (waiting on credentials, waiting on user confirmation, requires access not currently available, etc.).
+
+### 3. `PROGRESS.md` — the token-saving resume snapshot
+This is the highest-value file: everything PHASE 0 needs to skip re-detection. Structure:
+
+```markdown
+# Progress — DOMAIN
+Last updated: DATE
+
+## Connection
+- SSH: HOST:PORT, user USER (credentials in CREDENTIALS_FILE_PATH — not stored here)
+- Confirmed working pattern: `ssh -p PORT USER@HOST`
+
+## Detected stack (as of DATE — re-verify if much older)
+- Panel: PANEL_NAME
+- Webserver: WEBSERVER (version)
+- PHP: VERSION via HANDLER
+- WP_ROOT: /path/to/wordpress
+- WP-CLI: /path/to/wp (or "not available")
+- PHP-FPM pool config: /path/to/pool.conf (or "no access, shared hosting")
+- nginx config: /path/to/conf (or "n/a")
+- Object cache: STATUS (e.g. "no drop-in, Redis module present but unreachable")
+- Cache plugin: NAME
+
+## Fixes applied (with verification result)
+- 2026-07-03: Removed orphaned object-cache.php drop-in (FIX I). Verified: wp_using_ext_object_cache() now FALSE, home page TTFB unchanged (was never the bottleneck for cached pages).
+
+## Fixes pending (ready to run, just needs go-ahead or missing access)
+- FIX A (reduce max_children): blocked, no root/panel access confirmed yet. Safe value when unblocked: floor((available_ram_mb*0.75)/avg_worker_mb) using last measured RAM=X, avg_worker=Y.
+
+## Context notes
+- User does not want plugin X touched (explicitly confirmed 2026-06-21).
+- Site has no Redis/Memcached available on this hosting tier — don't re-suggest object-cache plugin installs, already confirmed unreachable on DATE.
+```
+
+Keep this file **factual and current**, not a session transcript — overwrite stale sections rather than appending narrative. If a fact changes (e.g. Redis becomes available after a hosting upgrade), update the line in place rather than leaving the old one to be re-discovered the hard way.
+
+**Discipline:** write/update these three files even when a session ends with everything fixed and nothing pending — a clean "all done as of DATE" `ACTION-PLAN.md` is still useful, since it tells the next session it can skip straight to a quick health re-check instead of doing a full fresh audit.
+
+---
+
 ## ADAPTATION RULES
 
 ### Shared hosting (no root, cPanel/Plesk UI only)
@@ -607,7 +708,7 @@ List any **remaining issues** not yet fixed (pending actions for the user, e.g.,
 
 ---
 
-## PHASE 7 — PageSpeed Insights integration (frontend/field data) — ⚠️ PENDING, not yet implemented
+## PHASE 8 — PageSpeed Insights integration (frontend/field data) — ⚠️ PENDING, not yet implemented
 
 **Status: planned, not built.** Flagged 2026-06-19 during an infortop.es session. Next session that touches this skill should implement this phase before considering the skill "done" for that round. Until implemented, the skill is purely server-side (SSH/PHP/DB) — it has no visibility into browser-rendering performance or real-user field data.
 
